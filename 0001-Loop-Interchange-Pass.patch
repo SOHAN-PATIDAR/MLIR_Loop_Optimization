@@ -1,0 +1,575 @@
+From bc50066c45cdbc28a30097ebbff38ec7a13e3955 Mon Sep 17 00:00:00 2001
+From: sohanpatidar <sohanpatidar@iisc.ac.in>
+Date: Tue, 22 Apr 2025 20:00:56 +0530
+Subject: [PATCH] Loop Interchange Pass
+
+---
+ mlir/include/mlir/Dialect/Affine/Passes.h     |   2 +
+ mlir/include/mlir/Dialect/Affine/Passes.td    |   8 +
+ .../Dialect/Affine/Transforms/CMakeLists.txt  |   2 +
+ .../Affine/Transforms/Loop_Interchange.cpp    | 509 ++++++++++++++++++
+ 4 files changed, 521 insertions(+)
+ create mode 100644 mlir/lib/Dialect/Affine/Transforms/Loop_Interchange.cpp
+
+diff --git a/mlir/include/mlir/Dialect/Affine/Passes.h b/mlir/include/mlir/Dialect/Affine/Passes.h
+index 96bd3c6a9a7b..98398b653506 100644
+--- a/mlir/include/mlir/Dialect/Affine/Passes.h
++++ b/mlir/include/mlir/Dialect/Affine/Passes.h
+@@ -117,6 +117,8 @@ std::unique_ptr<Pass> createAffineExpandIndexOpsPass();
+ /// operations.
+ std::unique_ptr<Pass> createAffineExpandIndexOpsAsAffinePass();
+ 
++/// Create a pass for loop Interchange. This pass will interchange the loops
++std::unique_ptr<mlir::OperationPass<func::FuncOp>>createAffineLoopInterchangePass();
+ //===----------------------------------------------------------------------===//
+ // Registration
+ //===----------------------------------------------------------------------===//
+diff --git a/mlir/include/mlir/Dialect/Affine/Passes.td b/mlir/include/mlir/Dialect/Affine/Passes.td
+index 0b8d5b7d9486..d565803c9244 100644
+--- a/mlir/include/mlir/Dialect/Affine/Passes.td
++++ b/mlir/include/mlir/Dialect/Affine/Passes.td
+@@ -412,4 +412,12 @@ def AffineExpandIndexOpsAsAffine : Pass<"affine-expand-index-ops-as-affine"> {
+   let constructor = "mlir::affine::createAffineExpandIndexOpsAsAffinePass()";
+ }
+ 
++// Adding code for loop interchange transformation
++
++def AffineLoopInterchange : Pass<"affine-loop-interchange", "func::FuncOp"> {
++  let summary = "Interchange affine loop nests using analytical cost model";
++  let constructor = "mlir::affine::createAffineLoopInterchangePass()";
++}
++
++
+ #endif // MLIR_DIALECT_AFFINE_PASSES
+diff --git a/mlir/lib/Dialect/Affine/Transforms/CMakeLists.txt b/mlir/lib/Dialect/Affine/Transforms/CMakeLists.txt
+index c42789b01bc9..45f1fd4b374b 100644
+--- a/mlir/lib/Dialect/Affine/Transforms/CMakeLists.txt
++++ b/mlir/lib/Dialect/Affine/Transforms/CMakeLists.txt
+@@ -17,6 +17,8 @@ add_mlir_dialect_library(MLIRAffineTransforms
+   SuperVectorize.cpp
+   SimplifyAffineStructures.cpp
+ 
++  Loop_Interchange.cpp
++
+   ADDITIONAL_HEADER_DIRS
+   ${MLIR_MAIN_INCLUDE_DIR}/mlir/Dialect/Affine
+ 
+diff --git a/mlir/lib/Dialect/Affine/Transforms/Loop_Interchange.cpp b/mlir/lib/Dialect/Affine/Transforms/Loop_Interchange.cpp
+new file mode 100644
+index 000000000000..0055dd1bf441
+--- /dev/null
++++ b/mlir/lib/Dialect/Affine/Transforms/Loop_Interchange.cpp
+@@ -0,0 +1,509 @@
++
++#include "mlir/Analysis/Presburger/IntegerRelation.h"
++#include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h"
++#include "mlir/Dialect/Affine/Analysis/AffineStructures.h"
++#include "mlir/Dialect/Affine/Analysis/LoopAnalysis.h"
++#include "mlir/Dialect/Affine/Analysis/Utils.h"
++#include "mlir/Dialect/Affine/IR/AffineOps.h"
++#include "mlir/Dialect/Affine/IR/AffineValueMap.h"
++#include "mlir/Dialect/Affine/LoopUtils.h"
++#include "mlir/Dialect/Affine/Passes.h"
++#include "mlir/Dialect/Affine/Transforms/Transforms.h"
++#include "mlir/Dialect/Affine/Utils.h"
++#include "mlir/Dialect/Func/IR/FuncOps.h"
++#include "mlir/IR/AffineExpr.h"
++#include "mlir/IR/Builders.h"
++#include "mlir/IR/IntegerSet.h"
++#include "mlir/Transforms/Passes.h"
++#include "llvm/ADT/DynamicAPInt.h"
++#include "llvm/ADT/SmallVector.h"
++#include "llvm/Support/Debug.h"
++#include <cstdlib>
++
++#define DEBUG_TYPE "affine-loop-interchange"
++
++using namespace mlir;
++using namespace mlir::affine;
++using namespace std;
++
++namespace {
++
++// Pass for interchanging affine loops to optimize locality and parallelism
++struct AffineLoopInterchangePass
++    : public PassWrapper<AffineLoopInterchangePass,
++                         OperationPass<func::FuncOp>> {
++  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(AffineLoopInterchangePass)
++
++  // Returns the command-line argument for the pass
++  StringRef getArgument() const final override {
++    return "affine-loop-interchange";
++  }
++
++  // Returns the description of the pass
++  StringRef getDescription() const final override {
++    return "Interchange affine loops for locality and parallelism";
++  }
++
++  // Main entry point for the pass
++  void runOnOperation() override;
++
++private:
++  // Processes perfectly nested loops starting from the root
++  LogicalResult processPerfectlyNestedLoops(AffineForOp rootFor);
++  // Finds all valid loop permutations
++  std::vector<std::vector<unsigned>>
++  findValidPermutations(ArrayRef<AffineForOp> loops);
++  // Identifies parallel loops
++  llvm::SmallVector<bool> getParallelLoops(ArrayRef<AffineForOp> loops);
++  // Computes trip counts for loops
++  llvm::SmallVector<uint64_t> computeTripCounts(ArrayRef<AffineForOp> loops);
++
++  // Helpers for reuse analysis:
++  llvm::SmallVector<std::vector<Operation *>>
++  getReuseGroupsForLoop(AffineForOp forOp, unsigned depth);
++  std::vector<std::vector<int>> getAccessMatrix(Operation *memOp);
++  llvm::SmallVector<unsigned>
++  getTemporalReuse(ArrayRef<std::vector<int>> accessMatrix);
++  llvm::SmallVector<unsigned>
++  getSpatialReuse(ArrayRef<std::vector<int>> accessMatrix);
++  bool hasSelfTemporalReuse(Operation *memOp, unsigned depth);
++  bool hasSelfSpatialReuse(Operation *memOp, unsigned depth);
++
++  // Group-level reuse tests:
++  bool hasGroupSpatialReuse(Operation *srcOpInst, Operation *dstOpInst,
++                            unsigned cacheLineSize = 8);
++  bool hasGroupTemporalReuse(Operation *srcOpInst, Operation *dstOpInst,
++                             unsigned loop, unsigned cacheLineSize = 8);
++};
++
++} // end anonymous namespace
++
++// Constructs the access matrix for a memory operation
++std::vector<std::vector<int>>
++AffineLoopInterchangePass::getAccessMatrix(Operation *memOp) {
++  // 1) Grab the affine map directly from the load/store
++  AffineMap map;
++  if (auto load = dyn_cast<AffineLoadOp>(memOp))
++    map = load.getAffineMap();
++  else
++    map = cast<AffineStoreOp>(memOp).getAffineMap();
++
++  // 2) Determine dimensions (number of loops) and rank (number of subscript
++  // terms)
++  unsigned depth = getNestingDepth(memOp);
++  unsigned rank = map.getNumResults();
++
++  std::vector<std::vector<int>> mat(rank, std::vector<int>(depth, 0));
++
++  return mat;
++}
++
++//===----------------------------------------------------------------------===//
++// Group‑reuse helpers
++//===----------------------------------------------------------------------===//
++
++// Checks for spatial reuse between two memory operations
++bool AffineLoopInterchangePass::hasGroupSpatialReuse(Operation *srcOpInst,
++                                                     Operation *dstOpInst,
++                                                     unsigned cacheLineSize) {
++  // Build constraints over both ops' enclosing loops
++  FlatAffineValueConstraints cst;
++  SmallVector<Operation *, 2> ops = {srcOpInst, dstOpInst};
++  if (failed(mlir::affine::getIndexSet(ops, &cst)))
++    return false;
++
++  // Compare the constant difference on each memref index dim
++  Value memref = isa<AffineLoadOp>(srcOpInst)
++                     ? cast<AffineLoadOp>(srcOpInst).getMemRef()
++                     : cast<AffineStoreOp>(srcOpInst).getMemRef();
++
++  unsigned arrayRank = cast<MemRefType>(memref.getType()).getRank();
++
++  for (unsigned r = 0; r < arrayRank; ++r) {
++    auto val = cst.atEq(r, cst.getNumCols() - 1);
++    int64_t diff = static_cast<int64_t>(val);
++    if (r + 1 < arrayRank && diff != 0)
++      return false;
++    if ((r == arrayRank - 1) &&
++        std::llabs(diff) < static_cast<int64_t>(cacheLineSize))
++      return true;
++  }
++  return false;
++}
++
++// Checks for temporal reuse between two memory operations
++bool AffineLoopInterchangePass::hasGroupTemporalReuse(Operation *srcOpInst,
++                                                      Operation *dstOpInst,
++                                                      unsigned loop,
++                                                      unsigned cacheLineSize) {
++  FlatAffineValueConstraints cst;
++  SmallVector<Operation *, 2> ops = {srcOpInst, dstOpInst};
++  if (failed(mlir::affine::getIndexSet(ops, &cst)))
++    return false;
++
++  Value memref = isa<AffineLoadOp>(srcOpInst)
++                     ? cast<AffineLoadOp>(srcOpInst).getMemRef()
++                     : cast<AffineStoreOp>(srcOpInst).getMemRef();
++  unsigned arrayRank = cast<MemRefType>(memref.getType()).getRank();
++  SmallVector<bool> variant(arrayRank, false);
++
++  // Determine which dims vary with the loop IV
++  for (unsigned r = 0; r < arrayRank; ++r) {
++    auto coeffVal = cst.atEq(r, loop);
++    int64_t coeff = static_cast<int64_t>(coeffVal);
++    if (coeff != 0)
++      variant[r] = true;
++  }
++
++  for (unsigned r = 0; r < arrayRank; ++r) {
++    auto diffVal = cst.atEq(r, cst.getNumCols() - 1);
++    int64_t diff = static_cast<int64_t>(diffVal);
++    if (!variant[r] && diff != 0)
++      return false;
++    if (variant[r] && std::llabs(diff) > static_cast<int64_t>(cacheLineSize))
++      return false;
++  }
++  return true;
++}
++
++// Identifies loops with temporal reuse
++llvm::SmallVector<unsigned>
++AffineLoopInterchangePass::getTemporalReuse(ArrayRef<std::vector<int>> mat) {
++  unsigned cols = mat[0].size(), rows = mat.size();
++  llvm::SmallVector<unsigned> reuse(cols, 0);
++  for (unsigned c = 0; c < cols; ++c) {
++    bool allZero = true;
++    for (unsigned r = 0; r < rows; ++r)
++      if (mat[r][c] != 0) {
++        allZero = false;
++        break;
++      }
++    if (allZero)
++      reuse[c] = 1;
++  }
++  return reuse;
++}
++
++// Identifies loops with spatial reuse
++llvm::SmallVector<unsigned> AffineLoopInterchangePass::getSpatialReuse(
++    ArrayRef<std::vector<int>> accessMatrix) {
++  constexpr int cacheLineSize = 8;
++  if (accessMatrix.empty())
++    return {};
++
++  unsigned cols = accessMatrix[0].size();
++  unsigned rows = accessMatrix.size();
++  llvm::SmallVector<unsigned> reuse(cols, 0);
++
++  for (unsigned loop = 0; loop < cols; ++loop) {
++    // Check all array dimensions for spatial reuse in this loop
++    for (unsigned dim = 0; dim < rows; ++dim) {
++      int stride = accessMatrix[dim][loop];
++      if (stride != 0 && std::abs(stride) < cacheLineSize) {
++        reuse[loop] = 1;
++        break; // Found spatial reuse in this loop dimension
++      }
++    }
++  }
++  return reuse;
++}
++
++// Checks for self-temporal reuse in a memory operation
++bool AffineLoopInterchangePass::hasSelfTemporalReuse(Operation *memOp,
++                                                     unsigned depth) {
++  auto mat = getAccessMatrix(memOp);
++  auto reuseMap = getTemporalReuse(mat);
++  return depth < reuseMap.size() && reuseMap[depth] == 1;
++}
++
++// Checks for self-spatial reuse in a memory operation
++bool AffineLoopInterchangePass::hasSelfSpatialReuse(Operation *memOp,
++                                                    unsigned depth) {
++  auto mat = getAccessMatrix(memOp);
++  auto reuseMap = getSpatialReuse(mat);
++  return depth < reuseMap.size() && reuseMap[depth] == 1;
++}
++
++// Groups memory operations for reuse analysis
++llvm::SmallVector<std::vector<Operation *>>
++AffineLoopInterchangePass::getReuseGroupsForLoop(AffineForOp forOp,
++                                                 unsigned depth) {
++  SmallVector<Operation *> ops;
++  forOp.getOperation()->walk([&](Operation *op) {
++    if (isa<AffineLoadOp>(op) || isa<AffineStoreOp>(op))
++      ops.push_back(op);
++  });
++  llvm::SmallVector<std::vector<Operation *>> groups;
++  SmallVector<bool> seen(ops.size(), false);
++
++  for (unsigned i = 0; i < ops.size(); ++i) {
++    if (seen[i])
++      continue;
++    std::vector<Operation *> grp{ops[i]};
++    seen[i] = true;
++    Value base = isa<AffineLoadOp>(ops[i])
++                     ? cast<AffineLoadOp>(ops[i]).getMemRef()
++                     : cast<AffineStoreOp>(ops[i]).getMemRef();
++
++    for (unsigned j = i + 1; j < ops.size(); ++j) {
++      if (seen[j])
++        continue;
++      // Must be same memref
++      Value otherBase = isa<AffineLoadOp>(ops[j])
++                            ? cast<AffineLoadOp>(ops[j]).getMemRef()
++                            : cast<AffineStoreOp>(ops[j]).getMemRef();
++      if (otherBase != base)
++        continue;
++
++      // Must have identical access matrix
++      auto A = getAccessMatrix(ops[i]), B = getAccessMatrix(ops[j]);
++      if (A != B)
++        continue;
++
++      // Either self-reuse or group-reuse
++      if (hasSelfTemporalReuse(ops[j], depth) ||
++          hasSelfSpatialReuse(ops[j], depth) ||
++          hasGroupTemporalReuse(ops[i], ops[j], depth) ||
++          hasGroupSpatialReuse(ops[i], ops[j])) {
++        grp.push_back(ops[j]);
++        seen[j] = true;
++      }
++    }
++    groups.push_back(std::move(grp));
++  }
++  return groups;
++}
++
++// Identifies parallel loops
++llvm::SmallVector<bool>
++AffineLoopInterchangePass::getParallelLoops(ArrayRef<AffineForOp> loops) {
++  unsigned n = loops.size();
++  llvm::SmallVector<bool> parallel(n, true);
++  std::vector<SmallVector<DependenceComponent, 2>> deps;
++  getDependenceComponents(loops[0], n, &deps);
++  for (auto &comp : deps) {
++    for (unsigned i = 0; i < n; ++i) {
++      if (comp[i].lb != 0 || comp[i].ub != 0) {
++        parallel[i] = false;
++        break;
++      }
++    }
++  }
++  return parallel;
++}
++
++// Computes trip counts for loops
++llvm::SmallVector<uint64_t>
++AffineLoopInterchangePass::computeTripCounts(ArrayRef<AffineForOp> loops) {
++  llvm::SmallVector<uint64_t> tc;
++  for (auto &f : loops)
++    if (auto v = getConstantTripCount(f))
++      tc.push_back(*v);
++    else
++      tc.push_back(std::numeric_limits<uint64_t>::max());
++  return tc;
++}
++
++// Finds all valid loop permutations
++std::vector<std::vector<unsigned>>
++AffineLoopInterchangePass::findValidPermutations(ArrayRef<AffineForOp> loops) {
++  unsigned n = loops.size();
++  std::vector<unsigned> arr(n);
++  std::iota(arr.begin(), arr.end(), 0);
++  std::vector<std::vector<unsigned>> valids;
++  do {
++    // Build inverse map: newPos[oldDepth] = newDepth
++    SmallVector<unsigned> newPos(n);
++    for (unsigned i = 0; i < n; ++i)
++      newPos[arr[i]] = i;
++    if (isValidLoopInterchangePermutation(loops, newPos))
++      valids.emplace_back(arr.begin(), arr.end());
++  } while (std::next_permutation(arr.begin(), arr.end()));
++  return valids;
++}
++
++// Processes perfectly nested loops
++LogicalResult
++AffineLoopInterchangePass::processPerfectlyNestedLoops(AffineForOp forOp) {
++  SmallVector<AffineForOp> loops;
++  getPerfectlyNestedLoops(loops, forOp);
++  unsigned n = loops.size();
++  if (n > 2) {
++    auto perms = findValidPermutations(loops);
++    for (auto &p : perms) {
++      bool identity = true;
++      for (unsigned i = 0; i < n; ++i)
++        if (p[i] != i) {
++          identity = false;
++          break;
++        }
++      if (!identity) {
++        SmallVector<unsigned> permMap(n);
++        for (unsigned oldD = 0; oldD < n; ++oldD)
++          permMap[oldD] =
++              std::distance(p.begin(), std::find(p.begin(), p.end(), oldD));
++        permuteLoops(loops, permMap);
++        return success();
++      }
++    }
++  }
++
++  // 1) Enumerate valid perms & mark which depths can be innermost
++  auto perms = findValidPermutations(loops);
++  if (perms.size() <= 1)
++    return success();
++  SmallVector<bool> canBeInner(n, false);
++  for (auto &p : perms)
++    canBeInner[p.back()] = true;
++
++  // 2) Compute reuse groups & trip counts
++  auto tripCounts = computeTripCounts(loops);
++
++  //   llvm::errs() << "Trip counts:";
++  //   for (unsigned d = 0; d < n; ++d)
++  //     llvm::errs() << " [" << d << "]=" << tripCounts[d];
++  //   llvm::errs() << "\n";
++
++  std::vector<uint64_t> memCost(n, std::numeric_limits<uint64_t>::max());
++  for (unsigned d = 0; d < n; ++d) {
++    if (!canBeInner[d])
++      continue;
++
++    uint64_t c = 0;
++    auto groups = getReuseGroupsForLoop(forOp, d);
++    for (auto &grp : groups) {
++      Operation *rep = grp.front();
++
++      // Detect self-temporal or group-temporal reuse
++      bool selfTemp = hasSelfTemporalReuse(rep, d);
++      bool groupTemp = false;
++      for (auto *other : grp)
++        if (other != rep && hasGroupTemporalReuse(rep, other, d))
++          groupTemp = true;
++
++      // Pick the per-group cost
++      uint64_t groupCost;
++      if (selfTemp || groupTemp) {
++        groupCost = 1; // Perfect temporal reuse
++      } else if (hasSelfSpatialReuse(rep, d) ||
++                 hasGroupSpatialReuse(rep, rep, 8)) {
++        groupCost = tripCounts[d] / 8; // Spatial reuse
++      } else {
++        groupCost = tripCounts[d]; // No reuse
++      }
++
++      // Accumulate the cost of this group
++      c += groupCost;
++    }
++
++    // Scale by all the other loops outside
++    for (unsigned od = 0; od < n; ++od)
++      if (od != d && tripCounts[od] != std::numeric_limits<uint64_t>::max())
++        c *= tripCounts[od];
++
++    memCost[d] = c;
++  }
++
++  //   // 3) Print memCost[]
++  //   llvm::errs() << "memCost[] =";
++  //   for (unsigned d = 0; d < n; ++d)
++  //     llvm::errs() << " [" << d << "]=" << memCost[d];
++  //   llvm::errs() << "\n";
++
++  // 4) Pick best inner loop d0
++  unsigned d0 =
++      std::min_element(memCost.begin(), memCost.end()) - memCost.begin();
++
++  //   llvm::errs() << "Chosen innermost depth = " << d0 << "\n";
++
++  // 5) Filter perms to those with d0 innermost
++  std::vector<std::vector<unsigned>> choices;
++  for (auto &p : perms) {
++    if (p.back() == d0) {
++      choices.push_back(p);
++    }
++  }
++
++  // 6) Compute syncCost for each choice
++  auto parallel = getParallelLoops(loops);
++  std::vector<uint64_t> syncCost(choices.size(), 0);
++  for (size_t i = 0; i < choices.size(); ++i) {
++    auto &perm = choices[i];
++    for (unsigned ld = 0; ld < n; ++ld) {
++      if (!parallel[ld] || ld == d0)
++        continue;
++      // Find position of ld in perm
++      auto pos = std::find(perm.begin(), perm.end(), ld) - perm.begin();
++      // Multiply tripCounts of all loops outside pos
++      uint64_t sc = 1;
++      for (unsigned j = 0; j < pos; ++j)
++        if (tripCounts[perm[j]] != std::numeric_limits<uint64_t>::max())
++          sc *= tripCounts[perm[j]];
++      syncCost[i] += sc;
++    }
++    // llvm::errs() << "Choice " << i << " perm=[";
++    // for (auto x : choices[i])
++    //   llvm::errs() << x << ",";
++    // llvm::errs() << "] syncCost=" << syncCost[i] << "\n";
++  }
++
++  // 7) Pick best permutation
++  unsigned bestIdx =
++      std::min_element(syncCost.begin(), syncCost.end()) - syncCost.begin();
++  auto bestPerm = choices[bestIdx];
++
++  // 8) Build and print permMap
++  SmallVector<unsigned, 4> permMap(n);
++  llvm::errs() << "Final permMap: ";
++  for (unsigned oldD = 0; oldD < n; ++oldD) {
++    permMap[oldD] = std::distance(
++        bestPerm.begin(), std::find(bestPerm.begin(), bestPerm.end(), oldD));
++    // llvm::errs() << oldD << "->" << permMap[oldD] << "  ";
++  }
++  //   llvm::errs() << "\n";
++
++  //   llvm::errs() << "Before:\n";
++  //   forOp.print(llvm::errs());
++
++  permuteLoops(loops, permMap);
++
++  //   llvm::errs() << "After:\n";
++  //   forOp.print(llvm::errs());
++
++  return success();
++}
++
++// Main entry point for the pass
++void AffineLoopInterchangePass::runOnOperation() {
++  func::FuncOp func = getOperation();
++
++  //   // Print original IR
++  //   llvm::errs() << "\n=== Original IR ===\n";
++  //   func.print(llvm::errs());
++  //   llvm::errs() << "\n";
++
++  LLVM_DEBUG({
++    llvm::dbgs() << "*** Before interchange ***\n";
++    func.dump();
++  });
++
++  func.walk([&](AffineForOp forOp) {
++    if (!forOp->getParentOfType<AffineForOp>()) {
++      if (failed(processPerfectlyNestedLoops(forOp))) {
++        signalPassFailure();
++        return;
++      }
++    }
++  });
++
++  //   // Print transformed IR
++  //   llvm::errs() << "\n=== Transformed IR ===\n";
++  //   func.print(llvm::errs());
++  //   llvm::errs() << "\n";
++}
++
++// Creates an instance of the AffineLoopInterchangePass
++std::unique_ptr<OperationPass<func::FuncOp>>
++mlir::affine::createAffineLoopInterchangePass() {
++  return std::make_unique<AffineLoopInterchangePass>();
++}
+\ No newline at end of file
+-- 
+2.34.1
+
